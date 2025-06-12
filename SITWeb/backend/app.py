@@ -1,7 +1,7 @@
 # backend/app.py
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-from chatbot import ask_chatbot
+from chatbot_caching import ask_chatbot
 
 app = Flask(__name__)
 CORS(app)
@@ -15,13 +15,14 @@ def chat():
     if not prompt:
         return jsonify({"error": "Empty prompt"}), 400
 
-    try:
-        response_text = ask_chatbot(prompt)
-        print("[DEBUG] Generated response:", response_text)
-        return jsonify({"response": response_text})
-    except Exception as e:
-        print("[ERROR]", e)
-        return jsonify({"error": str(e)}), 500
+    def generate():
+        try:
+            for chunk in ask_chatbot(prompt):
+                yield chunk
+        except Exception as e:
+            yield f"[ERROR]: {str(e)}"
+
+    return Response(stream_with_context(generate()), content_type='text/plain')
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

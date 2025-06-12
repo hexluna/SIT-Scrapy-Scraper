@@ -8,30 +8,66 @@ function App() {
   const [loading, setLoading] = useState(false);
 
   const handleSend = async () => {
-    if (!prompt.trim()) return;
-    setLoading(true);
-    const userMessage = { sender: "You", text: prompt };
-    setMessages((prev) => [...prev, userMessage]);
+  if (!prompt.trim()) return;
+  const userMessage = { sender: "You", text: prompt };
+  setMessages((prev) => [...prev, userMessage]);
+  setLoading(true);
+  setPrompt("");
 
-    try {
-      const res = await fetch("http://localhost:5000/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
-      const data = await res.json();
-      const botMessage = { sender: "Bot", text: data.response || data.error };
-      setMessages((prev) => [...prev, botMessage]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { sender: "Bot", text: "Error talking to server." },
-      ]);
-    }
+  const res = await fetch("http://localhost:5000/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+  });
 
-    setPrompt("");
-    setLoading(false);
-  };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+
+  let botText = "";
+  setMessages((prev) => [...prev, { sender: "Bot", text: "" }]); // placeholder
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    botText += chunk;
+
+    setMessages((prev) => {
+      const updated = [...prev];
+      updated[updated.length - 1] = { sender: "Bot", text: botText };
+      return updated;
+    });
+  }
+
+  setLoading(false);
+};
+
+  // const handleSend = async () => {
+  //   if (!prompt.trim()) return;
+  //   setLoading(true);
+  //   const userMessage = { sender: "You", text: prompt };
+  //   setMessages((prev) => [...prev, userMessage]);
+  //
+  //   try {
+  //     const res = await fetch("http://localhost:5000/chat", {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({ prompt }),
+  //     });
+  //     const data = await res.json();
+  //     const botMessage = { sender: "Bot", text: data.response || data.error };
+  //     setMessages((prev) => [...prev, botMessage]);
+  //   } catch (err) {
+  //     setMessages((prev) => [
+  //       ...prev,
+  //       { sender: "Bot", text: "Error talking to server." },
+  //     ]);
+  //   }
+  //
+  //   setPrompt("");
+  //   setLoading(false);
+  // };
 
   return (
     <div
@@ -53,7 +89,7 @@ function App() {
       >
         {messages.map((msg, i) => (
           <div key={i} style={{ margin: "10px 0" }}>
-            <b>{msg.sender}:</b> <span>{msg.text}</span>
+            <b>{msg.sender}:</b> <span style={{ whiteSpace: 'pre-line' }}>{msg.text}</span>
           </div>
         ))}
         {loading && (
