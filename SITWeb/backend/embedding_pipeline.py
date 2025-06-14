@@ -6,16 +6,21 @@ import faiss
 from hashlib import md5
 import torch
 import time
+import nltk
+from transformers import AutoTokenizer
+# nltk.download('punkt')
+from tqdm import tqdm
 
 
 class IncrementalEmbedder:
     def __init__(self,
-                 model_name='all-MiniLM-L6-v2',
+                 model_name='sentence-transformers/all-MiniLM-L6-v2',
                  data_dir='output',
                  index_dir='vector_index',
                  batch_size=512,
-                 chunk_size=150,
-                 chunk_overlap=10):
+                 chunk_size=450,
+                 chunk_overlap=50,
+                 chunk_token_limit=512):
 
         self.model_name = model_name
         self.data_dir = data_dir
@@ -25,6 +30,8 @@ class IncrementalEmbedder:
         self.batch_size = batch_size
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.chunk_token_limit = chunk_token_limit
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         os.makedirs(self.index_dir, exist_ok=True)
         self.model = SentenceTransformer(self.model_name, device='cuda')
@@ -56,12 +63,26 @@ class IncrementalEmbedder:
         return text.replace('\n', ' ').strip()
 
     def chunk_text(self, text):
-        words = text.split()
-        step = self.chunk_size - self.chunk_overlap
-        return [
-            " ".join(words[i:i + self.chunk_size])
-            for i in range(0, len(words), step)
-        ]
+        max_tokens = self.chunk_token_limit
+        #overlap = self.chunk_overlap
+        sentences = nltk.sent_tokenize(text)
+        chunks, current_chunk = [], []
+        current_len = 0
+
+        for sent in sentences:
+            sent_len = len(self.tokenizer.encode(sent, add_special_tokens=False, max_length=max_tokens, truncation=True))
+            if current_len + sent_len <= self.chunk_token_limit:
+                current_chunk.append(sent)
+                current_len += sent_len
+            else:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                current_chunk = [sent]
+                current_len = sent_len
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+        return chunks
 
     @staticmethod
     def infer_tags(text):
@@ -80,10 +101,8 @@ class IncrementalEmbedder:
         new_chunks = []
         new_metadata = []
         count_skipped = 0
-
-        for filename in os.listdir(self.data_dir):
-            if not filename.endswith('.json'):
-                continue
+        all_files = [f for f in os.listdir(self.data_dir) if f.endswith('.json')]
+        for filename in tqdm(all_files, desc="Processing files"):
             filepath = os.path.join(self.data_dir, filename)
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
