@@ -10,6 +10,7 @@ import requests
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from llama_cpp import Llama
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ========================== Config ========================== #
 EMBED_CACHE_PATH = "embedding_cache.json"
@@ -36,9 +37,37 @@ with open("vector_index/metadata.json", "r", encoding="utf-8") as f:
 # ========================== Embedding Model ========================== #
 print("Loading embedding model...")
 embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+# ========================== MMR Reranking ========================== #
+def mmr(query_embedding, doc_embeddings, k=4, lambda_param=0.5):
+    selected = []
+    doc_indices = list(range(len(doc_embeddings)))
+    sim_to_query = cosine_similarity([query_embedding], doc_embeddings)[0]
+    sim_matrix = cosine_similarity(doc_embeddings)
+
+    for _ in range(k):
+        if not doc_indices:
+            break
+        if not selected:
+            idx = np.argmax(sim_to_query)
+            selected.append(idx)
+            doc_indices.remove(idx)
+            continue
+
+        mmr_scores = []
+        for i in doc_indices:
+            relevance = sim_to_query[i]
+            diversity = max([sim_matrix[i][j] for j in selected])
+            score = lambda_param * relevance - (1 - lambda_param) * diversity
+            mmr_scores.append((i, score))
+
+        best_idx = max(mmr_scores, key=lambda x: x[1])[0]
+        selected.append(best_idx)
+        doc_indices.remove(best_idx)
+
+    return selected
 
 # ========================== Retriever ========================== #
-def retrieve_relevant_chunks(query, k=10):
+def retrieve_relevant_chunks(query, k=10, rerank_k=4, lambda_param=0.5):
     embed_start = time.time()
     if query in embedding_cache:
         query_vec = embedding_cache[query]
@@ -54,16 +83,28 @@ def retrieve_relevant_chunks(query, k=10):
     search_start = time.time()
     D, I = index.search(np.array([query_vec]), k)
     print(f"[Timing] FAISS search: {time.time() - search_start:.2f}s")
-
-    results = []
-    for idx, score in zip(I[0], D[0]):
+    doc_embeddings = []
+    valid_metadata = []
+    for idx in I[0]:
         if idx == -1:
             continue
-        score = float(score)
-        results.append((score, metadata[idx]))
-    results.sort(reverse=True, key=lambda x: x[0])
-    return [entry[1]["chunk_text"] for entry in results[:4]]
+        chunk = metadata[idx]["chunk_text"]
+        doc_embed = embedding_model.encode(chunk, normalize_embeddings=True)
+        doc_embeddings.append(doc_embed)
+        valid_metadata.append(metadata[idx])
 
+    if not doc_embeddings:
+        return []
+    selected_indices = mmr(query_vec, doc_embeddings, k=rerank_k, lambda_param=lambda_param)
+    results = []
+    # for idx, score in zip(I[0], D[0]):
+    #     if idx == -1:
+    #         continue
+    #     score = float(score)
+    #     results.append((score, metadata[idx]))
+    # results.sort(reverse=True, key=lambda x: x[0])
+    # return [entry[1]["chunk_text"] for entry in results[:4]]
+    return [valid_metadata[i]["chunk_text"] for i in selected_indices]
 # ========================== llama.cpp Model ========================== #
 model_name = "capybarahermes-2.5-mistral-7b.Q4_K_M.gguf"
 model_url = f"https://huggingface.co/TheBloke/CapybaraHermes-2.5-Mistral-7B-GGUF/resolve/main/{model_name}"
@@ -194,3 +235,5 @@ if __name__ == "__main__":
             json.dump({k: v.tolist() for k, v in embedding_cache.items()}, f, indent=2)
             print(f"[Cache] Saved {len(embedding_cache)} embeddings.")
         del llm
+
+
