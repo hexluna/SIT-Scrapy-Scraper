@@ -10,6 +10,8 @@ import nltk
 from transformers import AutoTokenizer
 # nltk.download('punkt')
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 
 class IncrementalEmbedder:
@@ -43,6 +45,7 @@ class IncrementalEmbedder:
         self.faiss_index = None
 
         self._load_existing()
+        self.lock = Lock()
 
     def _load_existing(self):
         if os.path.exists(self.metadata_path):
@@ -64,25 +67,53 @@ class IncrementalEmbedder:
 
     def chunk_text(self, text):
         max_tokens = self.chunk_token_limit
-        #overlap = self.chunk_overlap
-        sentences = nltk.sent_tokenize(text)
-        chunks, current_chunk = [], []
-        current_len = 0
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+        final_chunks = []
 
-        for sent in sentences:
-            sent_len = len(self.tokenizer.encode(sent, add_special_tokens=False, max_length=max_tokens, truncation=True))
-            if current_len + sent_len <= self.chunk_token_limit:
-                current_chunk.append(sent)
-                current_len += sent_len
+        for para in paragraphs:
+            token_len = len(
+                self.tokenizer.encode(para, add_special_tokens=False, max_length=max_tokens, truncation=True))
+
+            if token_len <= max_tokens:
+                final_chunks.append(para)
             else:
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                current_chunk = [sent]
-                current_len = sent_len
+                sentences = nltk.sent_tokenize(para)
+                if not sentences:
+                    continue
 
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-        return chunks
+                sentence_embeddings = self.model.encode(sentences, convert_to_tensor=True, normalize_embeddings=True)
+
+                current_chunk = []
+                current_tokens = 0
+                current_embedding = None
+
+                for i, sent in enumerate(sentences):
+                    sent_embedding = sentence_embeddings[i]
+                    sent_token_len = len(
+                        self.tokenizer.encode(sent, add_special_tokens=False, max_length=max_tokens, truncation=True))
+
+                    if not current_chunk:
+                        current_chunk.append(sent)
+                        current_tokens = sent_token_len
+                        current_embedding = sent_embedding
+                        continue
+
+                    similarity = torch.nn.functional.cosine_similarity(current_embedding, sent_embedding, dim=0).item()
+
+                    if similarity >= 0.6 and current_tokens + sent_token_len <= max_tokens:
+                        current_chunk.append(sent)
+                        current_tokens += sent_token_len
+                        current_embedding = (current_embedding + sent_embedding) / 2
+                    else:
+                        final_chunks.append(" ".join(current_chunk))
+                        current_chunk = [sent]
+                        current_tokens = sent_token_len
+                        current_embedding = sent_embedding
+
+                if current_chunk:
+                    final_chunks.append(" ".join(current_chunk))
+
+        return final_chunks
 
     @staticmethod
     def infer_tags(text):
@@ -97,47 +128,90 @@ class IncrementalEmbedder:
             tags.append("student_life")
         return tags
 
+    @staticmethod
+    def remove_boilerplate(text):
+        boilerplate_phrases = [
+            "all rights reserved", "copyright", "disclaimer", "terms and conditions",
+            "please note", "contact us", "follow us", "privacy policy"
+        ]
+        lines = text.split('\n')
+        filtered_lines = []
+        for line in lines:
+            line_lower = line.lower().strip()
+            if any(phrase in line_lower for phrase in boilerplate_phrases):
+                continue  # skip boilerplate line
+            if len(line.strip()) == 0:
+                continue  # skip empty lines
+            filtered_lines.append(line)
+        return "\n".join(filtered_lines)
+
+    @staticmethod
+    def remove_consecutive_duplicates(text):
+        lines = text.split('\n')
+        new_lines = []
+        prev_line = None
+        for line in lines:
+            line_strip = line.strip()
+            if line_strip != prev_line:
+                new_lines.append(line)
+            prev_line = line_strip
+        return "\n".join(new_lines)
+
+    def single_process_files(self, filename):
+        filepath = os.path.join(self.data_dir, filename)
+        new_chunks = []
+        new_metadata = []
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                raw_text = " ".join(
+                    data.get('article_texts', []) or data.get('text_lines', []) or data.get('content', []))
+                raw_text_no_boilerplate = self.remove_boilerplate(raw_text)
+                text_no_dupes = self.remove_consecutive_duplicates(raw_text_no_boilerplate)
+                clean = self.clean_text(text_no_dupes)
+                if not clean:
+                    return [], []
+                chunks = self.chunk_text(clean)
+                for chunk in chunks:
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+                    meta = {
+                        'file': filename,
+                        'url': data.get('url'),
+                        'title': data.get('title'),
+                        'meta_description': data.get('meta', {}).get('description'),
+                        'chunk_text': chunk,
+                        'tags': self.infer_tags(chunk)
+                    }
+                    new_chunks.append(chunk)
+                    new_metadata.append(meta)
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+        print(f"Prepared {len(new_chunks)} new chunks from {filename}.")
+        return new_chunks, new_metadata
+
     def process_files(self):
         new_chunks = []
         new_metadata = []
-        count_skipped = 0
         all_files = [f for f in os.listdir(self.data_dir) if f.endswith('.json')]
-        for filename in tqdm(all_files, desc="Processing files"):
-            filepath = os.path.join(self.data_dir, filename)
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    raw_text = " ".join(data.get('article_texts', []) or data.get('text_lines', []) or data.get('content', []))
-                    clean = self.clean_text(raw_text)
-                    if not clean:
-                        count_skipped += 1
-                        continue
-                    chunks = self.chunk_text(clean)
-                    for chunk in chunks:
-                        chunk = chunk.strip()
-                        if not chunk:
-                            continue
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(self.single_process_files, f): f for f in all_files}
+            for future in tqdm(as_completed(futures), total=len(all_files), desc="Processing files"):
+                chunks, metadata = future.result()
+                with self.lock:
+                    for chunk, meta in zip(chunks, metadata):
                         chunk_hash = md5(chunk.encode()).hexdigest()
                         if chunk_hash in self.hashes:
                             continue
                         self.hashes.add(chunk_hash)
-                        new_chunks.append(chunk)
-                        meta = {
-                            'id': self.id_counter,
-                            'file': filename,
-                            'url': data.get('url'),
-                            'title': data.get('title'),
-                            'meta_description': data.get('meta', {}).get('description'),
-                            'chunk_text': chunk,
-                            'tags': self.infer_tags(chunk)
-                        }
-                        new_metadata.append(meta)
+                        meta['id'] = self.id_counter
                         self.id_counter += 1
-            except Exception as e:
-                print(f"Error processing {filename}: {e}")
-                count_skipped += 1
+                        new_chunks.append(chunk)
+                        new_metadata.append(meta)
 
-        print(f"Prepared {len(new_chunks)} new chunks. Skipped {count_skipped} files.")
+        print(f"Prepared {len(new_chunks)} new chunks.")
         return new_chunks, new_metadata
 
     def embed_and_update(self, new_chunks, new_metadata):
