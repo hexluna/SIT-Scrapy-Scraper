@@ -11,6 +11,13 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from llama_cpp import Llama
 from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+# ========================== CrossEncoder ========================== #
+tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L6-v2")
+model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L6-v2")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
 
 # ========================== Config ========================== #
 EMBED_CACHE_PATH = "embedding_cache.json"
@@ -38,13 +45,13 @@ with open("vector_index/metadata.json", "r", encoding="utf-8") as f:
 print("Loading embedding model...")
 embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 # ========================== MMR Reranking ========================== #
-def mmr(query_embedding, doc_embeddings, k=4, lambda_param=0.5):
+def mmr(query_embedding, doc_embeddings, mmr_k=8, lambda_param=0.5):
     selected = []
     doc_indices = list(range(len(doc_embeddings)))
     sim_to_query = cosine_similarity([query_embedding], doc_embeddings)[0]
     sim_matrix = cosine_similarity(doc_embeddings)
 
-    for _ in range(k):
+    for _ in range(mmr_k):
         if not doc_indices:
             break
         if not selected:
@@ -65,9 +72,44 @@ def mmr(query_embedding, doc_embeddings, k=4, lambda_param=0.5):
         doc_indices.remove(best_idx)
 
     return selected
+# ========================== Cohere Reranking ========================== #
+def crossencoder_rerank(query, passages, top_n=4):
+    inputs = tokenizer(
+        [query] * len(passages),
+        passages,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        scores = outputs.logits[:, 0].tolist()
+
+    ranked = sorted(zip(passages, scores), key=lambda x: x[1], reverse=True)
+    return [p for p, _ in ranked[:top_n]]
 
 # ========================== Retriever ========================== #
-def retrieve_relevant_chunks(query, k=10, rerank_k=4, lambda_param=0.5):
+def deduplicate_chunks(chunks, threshold=0.92):
+    if len(chunks) <= 1:
+        return chunks
+
+    embeddings = embedding_model.encode(chunks, normalize_embeddings=True)
+    keep = []
+    seen = set()
+
+    for i in range(len(chunks)):
+        if i in seen:
+            continue
+        keep.append(chunks[i])
+        for j in range(i + 1, len(chunks)):
+            if j in seen:
+                continue
+            sim = cosine_similarity([embeddings[i]], [embeddings[j]])[0][0]
+            if sim > threshold:
+                seen.add(j)
+    return keep
+def retrieve_relevant_chunks(query, k=15, mmr_k=8, lambda_param=0.5, rerank_top=4):
     embed_start = time.time()
     if query in embedding_cache:
         query_vec = embedding_cache[query]
@@ -91,20 +133,17 @@ def retrieve_relevant_chunks(query, k=10, rerank_k=4, lambda_param=0.5):
         chunk = metadata[idx]["chunk_text"]
         doc_embed = embedding_model.encode(chunk, normalize_embeddings=True)
         doc_embeddings.append(doc_embed)
-        valid_metadata.append(metadata[idx])
+        # valid_metadata.append(metadata[idx])
+        valid_metadata.append(chunk)
 
     if not doc_embeddings:
         return []
-    selected_indices = mmr(query_vec, doc_embeddings, k=rerank_k, lambda_param=lambda_param)
-    results = []
-    # for idx, score in zip(I[0], D[0]):
-    #     if idx == -1:
-    #         continue
-    #     score = float(score)
-    #     results.append((score, metadata[idx]))
-    # results.sort(reverse=True, key=lambda x: x[0])
-    # return [entry[1]["chunk_text"] for entry in results[:4]]
-    return [valid_metadata[i]["chunk_text"] for i in selected_indices]
+    doc_embeddings = np.vstack(doc_embeddings)
+    selected_indices = mmr(query_vec, doc_embeddings, mmr_k, lambda_param=lambda_param)
+    mmr_passages = [valid_metadata[i] for i in selected_indices]
+    final_chunks = crossencoder_rerank(query, mmr_passages, top_n=rerank_top)
+    return final_chunks
+
 # ========================== llama.cpp Model ========================== #
 model_name = "capybarahermes-2.5-mistral-7b.Q4_K_M.gguf"
 model_url = f"https://huggingface.co/TheBloke/CapybaraHermes-2.5-Mistral-7B-GGUF/resolve/main/{model_name}"
@@ -157,6 +196,10 @@ INTENT_RESPONSES = {
 }
 
 # ========================== Chat Function ========================== #
+def chunk_text(text, max_chars=3000):
+    for i in range(0, len(text), max_chars):
+        yield text[i:i+max_chars]
+
 def ask_chatbot(query):
     cleaned_query = query.lower().strip()
 
@@ -177,10 +220,13 @@ def ask_chatbot(query):
     print("Retrieving relevant context...")
     retrieval_start = time.time()
     context_chunks = retrieve_relevant_chunks(query)
-    filtered_chunks = [clean_qa_format(chunk) for chunk in context_chunks]
-    context = "\n\n".join(filtered_chunks)
+    deduped_chunks = deduplicate_chunks(context_chunks)
+    filtered_chunks = [clean_qa_format(chunk) for chunk in deduped_chunks]
+    full_context = "\n\n".join(filtered_chunks)
     print(f"[Timing] Retrieval: {time.time() - retrieval_start:.2f}s")
-
+    max_prompt_tokens = 4096 - 1024
+    full_context = full_context[:max_prompt_tokens * 4]
+    full_output = ""
     # Prompt prep
     prompt_start = time.time()
     prompt = f"""You are an intelligent virtual assistant stationed at the SIT (Singapore Institute of Technology) Information Center. 
@@ -191,7 +237,8 @@ If the answer to a question is not in the context or not related to SIT, respond
 If providing a website link, always use the full URL format (e.g., https://www.sitlearn.singaporetech.edu.sg) so it can be clicked.
 
 Context:
-{context}
+{full_context}
+
 
 The user asked: "{query}"
 Respond with a helpful, plain-sentence explanation below:
@@ -235,5 +282,3 @@ if __name__ == "__main__":
             json.dump({k: v.tolist() for k, v in embedding_cache.items()}, f, indent=2)
             print(f"[Cache] Saved {len(embedding_cache)} embeddings.")
         del llm
-
-
