@@ -72,28 +72,43 @@ function App() {
   const renderMessageWithLinks = (msg) => {
     if (msg.sender !== "Bot")
       return <span style={{ whiteSpace: "pre-line" }}>{msg.text}</span>;
-    const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+
+    const regex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)|<((https?:\/\/[^>]+))>/g;
     const parts = [];
     let lastIndex = 0;
     let match;
 
-    while ((match = markdownLinkRegex.exec(msg.text)) !== null) {
+    while ((match = regex.exec(msg.text)) !== null) {
       if (match.index > lastIndex) {
         parts.push(
           <span key={lastIndex}>{msg.text.slice(lastIndex, match.index)}</span>
         );
       }
-      parts.push(
-        <a
-          key={match.index}
-          href={match[2]}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          {match[1]}
-        </a>
-      );
-      lastIndex = markdownLinkRegex.lastIndex;
+
+      if (match[1] && match[2]) {
+        parts.push(
+          <a
+            key={match.index}
+            href={match[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {match[1]}
+          </a>
+        );
+      } else if (match[3]) {
+        parts.push(
+          <a
+            key={match.index}
+            href={match[3]}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {match[3]}
+          </a>
+        );
+      }
+      lastIndex = regex.lastIndex;
     }
 
     if (lastIndex < msg.text.length) {
