@@ -74,9 +74,14 @@ def mmr(query_embedding, doc_embeddings, mmr_k=8, lambda_param=0.5):
     return selected
 # ========================== Cohere Reranking ========================== #
 def crossencoder_rerank(query, passages, top_n=4):
+    if isinstance(passages[0], dict):
+        passages_text = [p["text"] for p in passages]
+    else:
+        passages_text = passages
+
     inputs = tokenizer(
-        [query] * len(passages),
-        passages,
+        [query] * len(passages_text),
+        passages_text,
         padding=True,
         truncation=True,
         return_tensors="pt"
@@ -86,15 +91,14 @@ def crossencoder_rerank(query, passages, top_n=4):
         outputs = model(**inputs)
         scores = outputs.logits[:, 0].tolist()
 
-    ranked = sorted(zip(passages, scores), key=lambda x: x[1], reverse=True)
+    ranked = sorted(zip(passages_text, scores), key=lambda x: x[1], reverse=True)
     return [p for p, _ in ranked[:top_n]]
-
 # ========================== Retriever ========================== #
 def deduplicate_chunks(chunks, threshold=0.92):
     if len(chunks) <= 1:
         return chunks
 
-    embeddings = embedding_model.encode(chunks, normalize_embeddings=True)
+    embeddings = embedding_model.encode([c["text"] for c in chunks], normalize_embeddings=True)
     keep = []
     seen = set()
 
@@ -130,19 +134,29 @@ def retrieve_relevant_chunks(query, k=15, mmr_k=8, lambda_param=0.5, rerank_top=
     for idx in I[0]:
         if idx == -1:
             continue
+        entry = metadata[idx]
         chunk = metadata[idx]["chunk_text"]
+        url = entry.get("url", "")
+        tag = entry.get("tag", [])
+        title = entry.get("url", "")
         doc_embed = embedding_model.encode(chunk, normalize_embeddings=True)
         doc_embeddings.append(doc_embed)
         # valid_metadata.append(metadata[idx])
-        valid_metadata.append(chunk)
-
+        valid_metadata.append({"text": chunk, "url": url, "tags": tag, "title": title})
     if not doc_embeddings:
         return []
     doc_embeddings = np.vstack(doc_embeddings)
     selected_indices = mmr(query_vec, doc_embeddings, mmr_k, lambda_param=lambda_param)
     mmr_passages = [valid_metadata[i] for i in selected_indices]
     final_chunks = crossencoder_rerank(query, mmr_passages, top_n=rerank_top)
-    return final_chunks
+    final_results = []
+    for chunk in final_chunks:
+        for entry in mmr_passages:
+            if entry["text"] == chunk:
+                final_results.append(entry)
+                break
+
+    return final_results
 
 # ========================== llama.cpp Model ========================== #
 model_name = "capybarahermes-2.5-mistral-7b.Q4_K_M.gguf"
@@ -209,13 +223,15 @@ def ask_chatbot(query):
                 yield intent["response"]
                 return
 
-    def clean_qa_format(text):
-        lines = text.splitlines()
-        return " ".join([
+    def clean_qa_format(entry):
+        lines = entry["text"].splitlines()
+        clean_text = " ".join([
             line for line in lines
             if not re.match(r"^(Question:|Answer:)", line.strip())
             and not re.match(r"^What .*[\?？]$", line.strip())
         ]).strip()
+        formatted = f"**{entry['title']}**\nTags: {', '.join(entry['tags']) if entry['tags'] else 'None'}\n{clean_text}\nSource: {entry['url']}"
+        return formatted
 
     print("Retrieving relevant context...")
     retrieval_start = time.time()
@@ -232,9 +248,10 @@ def ask_chatbot(query):
     prompt = f"""You are an intelligent virtual assistant stationed at the SIT (Singapore Institute of Technology) Information Center. 
 Your job is to assist users by answering any questions they have about SIT. This includes topics like courses, admissions, campus facilities, events, student life, and academic programs. 
 Always speak in plain, friendly English. Never mimic a Q&A format.
+Each context item is structured with Title, Tags, URL, and Content. These provide useful metadata. Please reference them as needed to answer the user's query.
 If the user asks about your role, you can respond that you are an SIT chatbot here to help with information about the university.
 If the answer to a question is not in the context or not related to SIT, respond with "I'm sorry, I can only answer questions about SIT.
-If providing a website link, always use the full URL format (e.g., https://www.sitlearn.singaporetech.edu.sg) so it can be clicked.
+If providing a website link, always use the full URL format (e.g., https://www.singaporetech.edu.sg/) so it can be clicked and ensure the URL domain name is correct (e.g., singaporetech.edu.sg).
 
 Context:
 {full_context}
