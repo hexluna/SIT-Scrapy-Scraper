@@ -6,68 +6,89 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [showGreeting, setShowGreeting] = useState(true);
 
   const handleSend = async () => {
-    if (!prompt.trim()) return;
-    const userMessage = { sender: "You", text: prompt };
-    setMessages((prev) => [...prev, userMessage]);
-    setLoading(true);
-    setPrompt("");
+  if (!prompt.trim()) return;
+  const userMessage = { sender: "You", text: prompt };
+  setMessages((prev) => [...prev, userMessage]);
+  setLoading(true);
+  setPrompt("");
 
-    const res = await fetch("http://localhost:5000/chat", {
+  const res = await fetch("http://localhost:5000/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+  });
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+
+  let botText = "";
+  setMessages((prev) => [...prev, { sender: "Bot", text: "" }]); // placeholder
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    botText += chunk;
+
+    setMessages((prev) => {
+      const updated = [...prev];
+      updated[updated.length - 1] = { sender: "Bot", text: botText };
+      return updated;
+    });
+  }
+
+  setLoading(false);
+};
+  const handleFileUpload = async (file) => {
+    if (!file || file.type !== "application/pdf") {
+      alert("Please upload a valid PDF file.");
+      return;
+    }
+
+    setUploading(true);
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const res = await fetch("http://localhost:5000/upload", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: formData,
     });
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
 
     let botText = "";
-    setMessages((prev) => [...prev, { sender: "Bot", text: "" }]); // placeholder
+    setMessages((prev) => [...prev, {sender: "Bot", text: ""}]);
 
     while (true) {
-      const { done, value } = await reader.read();
+      const {done, value} = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value, { stream: true });
+      const chunk = decoder.decode(value, {stream: true});
       botText += chunk;
 
       setMessages((prev) => {
         const updated = [...prev];
-        updated[updated.length - 1] = { sender: "Bot", text: botText };
+        updated[updated.length - 1] = {sender: "Bot", text: botText};
         return updated;
       });
     }
+  }
 
-    setLoading(false);
+  const handleDrop = (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    handleFileUpload(file);
   };
-  // const handleSend = async () => {
-  //   if (!prompt.trim()) return;
-  //   setLoading(true);
-  //   const userMessage = { sender: "You", text: prompt };
-  //   setMessages((prev) => [...prev, userMessage]);
-  //
-  //   try {
-  //     const res = await fetch("http://localhost:5000/chat", {
-  //       method: "POST",
-  //       headers: { "Content-Type": "application/json" },
-  //       body: JSON.stringify({ prompt }),
-  //     });
-  //     const data = await res.json();
-  //     const botMessage = { sender: "Bot", text: data.response || data.error };
-  //     setMessages((prev) => [...prev, botMessage]);
-  //   } catch (err) {
-  //     setMessages((prev) => [
-  //       ...prev,
-  //       { sender: "Bot", text: "Error talking to server." },
-  //     ]);
-  //   }
-  //
-  //   setPrompt("");
-  //   setLoading(false);
-  // };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+  };
 
   const renderMessageWithLinks = (msg) => {
     if (msg.sender !== "Bot")
@@ -117,7 +138,6 @@ function App() {
 
     return <span style={{ whiteSpace: "pre-line" }}>{parts}</span>;
   };
-
   return (
     <div
       style={{
@@ -195,8 +215,23 @@ function App() {
           </p>
         </div>
       )}
-
       <h2>SIT Chatbot</h2>
+      {/* Drag & Drop PDF */}
+      <div
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        style={{
+          border: "2px dashed #999",
+          borderRadius: 8,
+          padding: 20,
+          textAlign: "center",
+          marginBottom: 10,
+        }}
+      >
+        {uploading ? "Uploading and processing PDF..." : "Drag and drop a PDF file here"}
+      </div>
+
+      {/* Chat messages */}
       <div
         style={{
           border: "1px solid #ccc",
@@ -207,7 +242,7 @@ function App() {
       >
         {messages.map((msg, i) => (
           <div key={i} style={{ margin: "10px 0" }}>
-            <b>{msg.sender}:</b> {renderMessageWithLinks(msg)}
+            <b>{msg.sender}:</b> <span style={{ whiteSpace: 'pre-line' }}>{msg.text}</span>
           </div>
         ))}
         {loading && (
